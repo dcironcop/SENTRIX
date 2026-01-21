@@ -20,6 +20,7 @@ class User(UserMixin, db.Model):
     two_factor_secret = db.Column(db.String(32))  # TOTP secret
     # Password policy
     password_changed_at = db.Column(db.DateTime)
+    require_password_change = db.Column(db.Boolean, default=False)
     failed_login_attempts = db.Column(db.Integer, default=0)
     locked_until = db.Column(db.DateTime)  # Account lockout
 
@@ -68,6 +69,8 @@ class Camera(db.Model):
     # ===== NHÓM D – VỊ TRÍ =====
     install_areas = db.Column(db.Text)         # ["Cổng và vỉa hè"]
     latlon = db.Column(db.String(50), index=True)  # "19.8,105.77" - Index cho tìm kiếm camera có tọa độ
+    latitude = db.Column(db.Float, index=True)
+    longitude = db.Column(db.Float, index=True)
 
     # ===== NHÓM E – TÀI KHOẢN / KẾT NỐI =====
     login_user = db.Column(db.String(100))
@@ -103,6 +106,18 @@ class Camera(db.Model):
             return json.loads(val)
         except:
             return []
+
+    def set_latlon_components(self):
+        """Parse latlon string and store latitude/longitude if available."""
+        if not self.latlon:
+            return
+        try:
+            lat_str, lon_str = self.latlon.split(",", 1)
+            self.latitude = float(lat_str.strip())
+            self.longitude = float(lon_str.strip())
+        except Exception:
+            self.latitude = None
+            self.longitude = None
 
 
 # =========================

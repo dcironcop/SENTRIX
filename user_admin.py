@@ -1,7 +1,8 @@
 from flask import Blueprint, render_template, request, redirect, url_for, flash, current_app
 from flask_login import login_required, current_user
-from werkzeug.security import generate_password_hash
 from models import db, User
+from security_utils import log_audit, sanitize_input
+from services.user_service import create_user
 
 user_bp = Blueprint("user", __name__, url_prefix="/users")
 
@@ -53,29 +54,16 @@ def create_user():
         flash("Tên đăng nhập đã tồn tại", "warning")
         return redirect(url_for("user.manage_users"))
 
-    # Validate password
-    config = current_app.config
-    is_valid, error_msg = validate_password(
-        password,
-        min_length=config.get('PASSWORD_MIN_LENGTH', 8),
-        require_uppercase=config.get('PASSWORD_REQUIRE_UPPERCASE', True),
-        require_lowercase=config.get('PASSWORD_REQUIRE_LOWERCASE', True),
-        require_number=config.get('PASSWORD_REQUIRE_NUMBER', True),
-        require_special=config.get('PASSWORD_REQUIRE_SPECIAL', True)
+    user, error_msg = create_user(
+        username=username,
+        password=password,
+        role=role,
+        config=current_app.config,
+        require_password_change=True,
     )
-    
-    if not is_valid:
+    if error_msg:
         flash(f"❌ {error_msg}", "danger")
         return redirect(url_for("user.manage_users"))
-
-    user = User(
-        username=username,
-        password=generate_password_hash(password),
-        role=role,
-        password_changed_at=datetime.utcnow()
-    )
-    db.session.add(user)
-    db.session.commit()
     
     # Log audit
     log_audit('create', 'user', user.id, {'username': username, 'role': role})

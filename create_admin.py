@@ -12,7 +12,8 @@ with app.app_context():
             username="admin",
             password=generate_password_hash("123456"),
             role="admin",
-            active=True
+            active=True,
+            require_password_change=True
         )
         db.session.add(admin)
         db.session.commit()
