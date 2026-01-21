@@ -13,6 +13,7 @@ class Config:
     
     # Upload folder
     UPLOAD_FOLDER = 'uploads'
+    EXPORT_FOLDER = 'exports'
     MAX_CONTENT_LENGTH = 16 * 1024 * 1024  # 16MB max file size
     ALLOWED_EXTENSIONS = {'xls', 'xlsx'}
     

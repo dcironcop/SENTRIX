@@ -29,6 +29,7 @@ import re
 import bleach
 from datetime import datetime
 from flask import request, current_app
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from models import db, AuditLog, LoginHistory, User
 
 

@@ -1,6 +1,7 @@
 from flask import Blueprint, render_template, request, jsonify, current_app
 from flask_login import login_required
 from models import db, Camera
+from sqlalchemy import text
 from color_utils import build_system_color_map
 import math
 import requests
@@ -17,6 +18,24 @@ def parse_latlon(latlon):
         return float(lat.strip()), float(lon.strip())
     except Exception:
         return None, None
+
+
+def get_camera_coordinates(camera):
+    if camera.latitude is not None and camera.longitude is not None:
+        return camera.latitude, camera.longitude
+    return parse_latlon(camera.latlon or "")
+
+
+def bounding_box(lat, lon, radius_m):
+    lat_rad = math.radians(lat)
+    lat_delta = radius_m / 111320
+    lon_delta = radius_m / (111320 * math.cos(lat_rad)) if math.cos(lat_rad) else 0
+    return (
+        lat - lat_delta,
+        lat + lat_delta,
+        lon - lon_delta,
+        lon + lon_delta,
+    )
 
 
 def distance_m(lat1, lon1, lat2, lon2):
@@ -38,7 +57,10 @@ def distance_m(lat1, lon1, lat2, lon2):
 def index():
     focus_id = request.args.get("camera_id", type=int)
     return_url = request.args.get("return_url")  # Lấy return_url từ query string
-    cameras = Camera.query.filter(Camera.latlon.isnot(None)).all()
+    cameras = Camera.query.filter(
+        (Camera.latitude.isnot(None) & Camera.longitude.isnot(None))
+        | Camera.latlon.isnot(None)
+    ).all()
     # Luôn trả về color_map với 6 hệ thống cố định (có cache)
     cache = None
     try:
@@ -51,9 +73,8 @@ def index():
     # This avoids N+1 query problem and improves performance
     cam_data = []
     for c in cameras:
-        parsed = parse_latlon(c.latlon)
-        if parsed and parsed[0] and parsed[1]:
-            lat, lon = parsed[0], parsed[1]
+        lat, lon = get_camera_coordinates(c)
+        if lat is not None and lon is not None:
             system_type = c.system_type or "Chưa phân loại"
             cam_data.append({
                 "id": c.id,
@@ -88,13 +109,34 @@ def search_radius():
 
     results = []
 
-    cameras = Camera.query.filter(Camera.latlon.isnot(None)).all()
+    if lat is None or lon is None or radius is None:
+        return jsonify([])
+
+    min_lat, max_lat, min_lon, max_lon = bounding_box(lat, lon, radius)
+    if db.engine.dialect.name == "postgresql":
+        cameras = Camera.query.filter(
+            Camera.latitude.isnot(None),
+            Camera.longitude.isnot(None),
+            text(
+                "ST_DWithin("
+                "ST_SetSRID(ST_MakePoint(camera.longitude, camera.latitude), 4326)::geography, "
+                "ST_SetSRID(ST_MakePoint(:lon, :lat), 4326)::geography, "
+                ":radius"
+                ")"
+            ),
+        ).params(lat=lat, lon=lon, radius=radius).all()
+    else:
+        cameras = Camera.query.filter(
+            Camera.latitude.isnot(None),
+            Camera.longitude.isnot(None),
+            Camera.latitude.between(min_lat, max_lat),
+            Camera.longitude.between(min_lon, max_lon),
+        ).all()
     # OPTIMIZE: Parse latlon once per camera
     for c in cameras:
-        parsed = parse_latlon(c.latlon)
-        if not parsed or not parsed[0] or not parsed[1]:
+        clat, clon = get_camera_coordinates(c)
+        if clat is None or clon is None:
             continue
-        clat, clon = parsed[0], parsed[1]
         d = distance_m(lat, lon, clat, clon)
         if d <= radius:
                 results.append({

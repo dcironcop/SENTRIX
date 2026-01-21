@@ -1,15 +1,12 @@
-from flask import Blueprint, render_template, request, redirect, url_for, flash, current_app
-from flask_caching import Cache
+from flask import Blueprint, render_template, request, redirect, url_for, flash, current_app, jsonify
 from flask_login import login_required, current_user
 from werkzeug.utils import secure_filename
-from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 import os
 import re
 import pandas as pd
 
-from models import db, Camera
-from parse_m2 import parse_m2_to_records
-from security_utils import log_audit
+from background_jobs import get_job, start_job
+from services.import_service import process_import
 
 # Batch size for committing records (configurable)
 DEFAULT_BATCH_SIZE = 100  # Commit every 100 records
@@ -272,230 +269,86 @@ def index():
 
         # Support multiple file types
         filename_lower = file.filename.lower()
-        if filename_lower.endswith(('.xls', '.xlsx')):
-            allowed_ext = {'xls', 'xlsx'}
-        elif filename_lower.endswith('.csv'):
-            allowed_ext = {'csv'}
-        elif filename_lower.endswith('.json'):
-            allowed_ext = {'json'}
+        if filename_lower.endswith((".xls", ".xlsx")):
+            allowed_ext = {"xls", "xlsx"}
+        elif filename_lower.endswith(".csv"):
+            allowed_ext = {"csv"}
+        elif filename_lower.endswith(".json"):
+            allowed_ext = {"json"}
         else:
-            allowed_ext = current_app.config.get('ALLOWED_EXTENSIONS', {'xls', 'xlsx', 'csv', 'json'})
-        
+            allowed_ext = current_app.config.get("ALLOWED_EXTENSIONS", {"xls", "xlsx", "csv", "json"})
+
         if not allowed_file(file.filename, allowed_ext):
             flash("❌ Chỉ chấp nhận file Excel (.xls, .xlsx), CSV (.csv), hoặc JSON (.json)", "danger")
             return redirect(url_for("import.index"))
 
-        upload_folder = current_app.config.get('UPLOAD_FOLDER', 'uploads')
+        upload_folder = current_app.config.get("UPLOAD_FOLDER", "uploads")
         os.makedirs(upload_folder, exist_ok=True)
 
         filename = secure_filename(file.filename)
         filepath = os.path.join(upload_folder, filename)
-        
+
         # Kiểm tra kích thước file
-        max_size = current_app.config.get('MAX_CONTENT_LENGTH', 16 * 1024 * 1024)
+        max_size = current_app.config.get("MAX_CONTENT_LENGTH", 16 * 1024 * 1024)
         file.seek(0, os.SEEK_END)
         file_size = file.tell()
         file.seek(0)
-        
+
         if file_size > max_size:
             flash(f"❌ File quá lớn. Kích thước tối đa: {max_size // 1024 // 1024}MB", "danger")
             return redirect(url_for("import.index"))
-        
+
         file.save(filepath)
 
-        success = 0
-        errors = 0
-        error_details = []  # Danh sách chi tiết các lỗi
-        batch_size = current_app.config.get('IMPORT_BATCH_SIZE', DEFAULT_BATCH_SIZE)
-        batch_count = 0  # Số records đã add vào batch hiện tại
+        batch_size = current_app.config.get("IMPORT_BATCH_SIZE", DEFAULT_BATCH_SIZE)
+        async_mode = request.form.get("async") == "1"
+
+        if async_mode:
+            job_id = start_job(
+                process_import,
+                current_app._get_current_object(),
+                filepath,
+                current_user.id,
+                batch_size,
+                convert_latlon,
+                validate_phone,
+            )
+            return jsonify({"job_id": job_id, "status_url": url_for("import.import_status", job_id=job_id)})
 
         try:
-            records = parse_m2_to_records(filepath)
-            total_records = len(records)
-            current_app.logger.info(f"Starting import of {total_records} records with batch size {batch_size}")
+            result = process_import(
+                current_app._get_current_object(),
+                filepath,
+                current_user.id,
+                batch_size,
+                convert_latlon,
+                validate_phone,
+            )
         except (ValueError, KeyError, FileNotFoundError, PermissionError, pd.errors.EmptyDataError) as e:
             flash(f"❌ Lỗi đọc file: {str(e)}", "danger")
             current_app.logger.error(f"File parsing error: {e}", exc_info=True)
             return redirect(url_for("import.index"))
         except Exception as e:
-            # Catch-all for unexpected errors
             flash(f"❌ Lỗi không xác định khi đọc file: {str(e)}", "danger")
             current_app.logger.error(f"Unexpected file parsing error: {e}", exc_info=True)
             return redirect(url_for("import.index"))
 
-        for idx, record in enumerate(records, start=1):
-            try:
-                # =========================
-                # Validate tối thiểu
-                # =========================
-                if not record.get("system_type"):
-                    raise ValueError("Thiếu hệ thống camera")
-
-                if record.get("camera_index") is None:
-                    raise ValueError("Thiếu thứ tự camera")
-                
-                # Validate và chuyển đổi latlon format
-                latlon_value = record.get("latlon")
-                if latlon_value:
-                    converted_latlon = convert_latlon(latlon_value)
-                    if converted_latlon:
-                        latlon_value = converted_latlon
-                    else:
-                        raise ValueError(f"Tọa độ không hợp lệ: {record.get('latlon')}")
-                
-                # Validate phone
-                if record.get("phone") and not validate_phone(record.get("phone")):
-                    raise ValueError(f"Số điện thoại không hợp lệ: {record.get('phone')}")
-
-                cam = Camera(
-                    owner_name=record.get("owner_name"),
-                    organization_name=record.get("organization_name"),
-                    address_street=record.get("address_street"),
-                    ward=record.get("ward"),
-                    province=record.get("province"),
-                    phone=record.get("phone"),
-
-                    camera_index=record.get("camera_index"),
-                    system_type=record.get("system_type"),
-
-                    retention_days=record.get("retention_days"),
-
-                    manufacturer=record.get("manufacturer"),
-
-                    latlon=latlon_value,
-
-                    login_user=record.get("login_user"),
-                    login_password=record.get("login_password"),
-                    login_domain=record.get("login_domain"),
-                    static_ip=record.get("static_ip"),
-                    ip_port=record.get("ip_port"),
-                    dvr_model=record.get("dvr_model"),
-                    camera_model=record.get("camera_model"),
-
-                    resolution=record.get("resolution"),
-                    bandwidth=record.get("bandwidth"),
-                    serial_number=record.get("serial_number"),
-                    verification_code=record.get("verification_code"),
-                    category=record.get("category"),
-                    sharing_scope=record.get("sharing_scope", False),
-                )
-
-                # =========================
-                # Set JSON fields
-                # =========================
-                cam.set_json("monitoring_modes", record.get("monitoring_modes", []))
-                cam.set_json("storage_types", record.get("storage_types", []))
-                cam.set_json("camera_types", record.get("camera_types", []))
-                cam.set_json("form_factors", record.get("form_factors", []))
-                cam.set_json("network_types", record.get("network_types", []))
-                cam.set_json("install_areas", record.get("install_areas", []))
-
-                db.session.add(cam)
-                success += 1
-                batch_count += 1
-
-                # OPTIMIZE: Batch commit để cải thiện performance và quản lý transaction
-                # Commit mỗi batch_size records thay vì commit tất cả cùng lúc
-                if batch_count >= batch_size:
-                    try:
-                        db.session.commit()
-                        current_app.logger.debug(f"Committed batch: {success} records processed so far")
-                        batch_count = 0
-                    except (SQLAlchemyError, IntegrityError) as e:
-                        db.session.rollback()
-                        current_app.logger.error(f"Error committing batch at record {idx}: {e}", exc_info=True)
-                        # Continue processing other records even if batch commit fails
-                        # Individual errors will be caught below
-
-            except (ValueError, TypeError, AttributeError) as e:
-                # Data validation errors
-                errors += 1
-                error_msg = str(e)
-                # Lấy thông tin camera để hiển thị (nếu có)
-                camera_info = ""
-                if record.get("system_type"):
-                    camera_info = f" - Hệ thống: {record.get('system_type')}"
-                if record.get("camera_index") is not None:
-                    camera_info += f", Thứ tự: {record.get('camera_index')}"
-                
-                error_details.append({
-                    "row": idx,
-                    "error": error_msg,
-                    "info": camera_info
-                })
-                current_app.logger.warning(f"Validation error at record {idx}: {e}")
-                continue
-            except (SQLAlchemyError, IntegrityError) as e:
-                # Database errors
-                errors += 1
-                error_msg = f"Database error: {str(e)}"
-                current_app.logger.error(f"Database error importing camera record {idx}: {e}", exc_info=True)
-                db.session.rollback()  # Rollback failed record
-                # Lấy thông tin camera để hiển thị (nếu có)
-                camera_info = ""
-                if record.get("system_type"):
-                    camera_info = f" - Hệ thống: {record.get('system_type')}"
-                if record.get("camera_index") is not None:
-                    camera_info += f", Thứ tự: {record.get('camera_index')}"
-                
-                error_details.append({
-                    "row": idx,
-                    "error": error_msg,
-                    "info": camera_info
-                })
-                continue
-            except Exception as e:
-                # Other unexpected errors
-                errors += 1
-                error_msg = str(e)
-                current_app.logger.error(f"Unexpected error importing camera record {idx}: {e}", exc_info=True)
-                db.session.rollback()  # Rollback failed record
-                # Lấy thông tin camera để hiển thị (nếu có)
-                camera_info = ""
-                if record.get("system_type"):
-                    camera_info = f" - Hệ thống: {record.get('system_type')}"
-                if record.get("camera_index") is not None:
-                    camera_info += f", Thứ tự: {record.get('camera_index')}"
-                
-                error_details.append({
-                    "row": idx,
-                    "error": error_msg,
-                    "info": camera_info
-                })
-                continue
-
-        # Commit remaining records (nếu còn records chưa commit)
-        if batch_count > 0:
-            try:
-                db.session.commit()
-                current_app.logger.debug(f"Committed final batch: {success} total records processed")
-            except (SQLAlchemyError, IntegrityError) as e:
-                db.session.rollback()
-                current_app.logger.error(f"Error committing final batch: {e}", exc_info=True)
-                flash(f"⚠️ Có lỗi khi commit batch cuối cùng: {str(e)}", "warning")
-
-        # Clear cache sau khi import dữ liệu mới
-        try:
-            cache = current_app.extensions.get('cache')
-            if cache and hasattr(cache, 'delete'):
-                cache.delete('dashboard_stats')
-                cache.delete('system_color_map')
-        except (AttributeError, TypeError, KeyError, RuntimeError) as e:
-            # Cache chưa được init hoặc không phải Cache object
-            pass
-
-        # Lưu chi tiết lỗi vào session để hiển thị trong template
-        from flask import session
-        if errors:
-            session['import_errors'] = error_details
-            flash(f"⚠️ Import xong: {success} camera, {errors} dòng lỗi", "warning")
-        else:
-            session.pop('import_errors', None)  # Xóa lỗi cũ nếu không có lỗi
-            flash(f"✅ Import thành công {success} camera", "success")
+        flash(f"✅ Import hoàn tất: {result['success']} thành công, {result['errors']} lỗi", "success")
+        if result["details"]:
+            return render_template("import/result.html", errors=result["details"])
 
         return redirect(url_for("import.index"))
 
     return render_template("import/index.html")
+
+
+@import_bp.route("/status/<job_id>")
+@login_required
+def import_status(job_id):
+    job = get_job(job_id)
+    if not job:
+        return jsonify({"error": "Job not found"}), 404
+    return jsonify(job)
 
 
 @import_bp.route("/clear-errors", methods=["POST"])

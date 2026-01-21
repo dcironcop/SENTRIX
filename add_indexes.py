@@ -65,6 +65,16 @@ def add_indexes():
                 indexes_to_create.append(
                     Index('ix_camera_latlon', Camera.latlon)
                 )
+
+            if 'ix_camera_latitude' not in existing_indexes:
+                indexes_to_create.append(
+                    Index('ix_camera_latitude', Camera.latitude)
+                )
+
+            if 'ix_camera_longitude' not in existing_indexes:
+                indexes_to_create.append(
+                    Index('ix_camera_longitude', Camera.longitude)
+                )
             
             # Tạo các indexes
             if indexes_to_create:

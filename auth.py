@@ -1,6 +1,6 @@
 from flask import Blueprint, render_template, request, redirect, url_for, flash, session, jsonify, current_app
 from flask_login import login_user, logout_user, login_required, current_user
-from werkzeug.security import check_password_hash
+from werkzeug.security import check_password_hash, generate_password_hash
 from datetime import datetime, timedelta
 import pyotp
 import qrcode
@@ -8,6 +8,7 @@ import io
 import base64
 
 from models import db, User
+from security_utils import log_audit
 from security_utils import log_login, validate_password, sanitize_input, get_client_ip
 
 auth_bp = Blueprint("auth", __name__)
@@ -53,6 +54,8 @@ def login():
             session.permanent = True
             log_login(user, success=True)
             flash("✅ Đăng nhập thành công", "success")
+            if user.require_password_change:
+                return redirect(url_for("auth.change_password"))
             return redirect(url_for("dashboard.index"))
         else:
             # Đăng nhập thất bại
@@ -73,6 +76,58 @@ def login():
             log_login(user if user else None, success=False, failure_reason="Invalid credentials")
 
     return render_template("auth/login.html")
+
+
+@auth_bp.before_app_request
+def enforce_password_change():
+    if not current_user.is_authenticated:
+        return None
+    if not current_user.require_password_change:
+        return None
+
+    allowed_endpoints = {
+        "auth.change_password",
+        "auth.logout",
+        "auth.login",
+        "static",
+    }
+    if request.endpoint in allowed_endpoints or request.endpoint is None:
+        return None
+    return redirect(url_for("auth.change_password"))
+
+
+@auth_bp.route("/change-password", methods=["GET", "POST"])
+@login_required
+def change_password():
+    if request.method == "POST":
+        new_password = request.form.get("new_password", "")
+        confirm_password = request.form.get("confirm_password", "")
+
+        if not new_password or new_password != confirm_password:
+            flash("❌ Mật khẩu xác nhận không khớp", "danger")
+            return render_template("auth/change_password.html")
+
+        is_valid, error_msg = validate_password(
+            new_password,
+            min_length=current_app.config.get("PASSWORD_MIN_LENGTH", 8),
+            require_uppercase=current_app.config.get("PASSWORD_REQUIRE_UPPERCASE", True),
+            require_lowercase=current_app.config.get("PASSWORD_REQUIRE_LOWERCASE", True),
+            require_number=current_app.config.get("PASSWORD_REQUIRE_NUMBER", True),
+            require_special=current_app.config.get("PASSWORD_REQUIRE_SPECIAL", True),
+        )
+        if not is_valid:
+            flash(f"❌ {error_msg}", "danger")
+            return render_template("auth/change_password.html")
+
+        current_user.password = generate_password_hash(new_password)
+        current_user.require_password_change = False
+        current_user.password_changed_at = datetime.utcnow()
+        db.session.commit()
+        log_audit("edit", "user", current_user.id, {"action": "change_password"})
+        flash("✅ Đổi mật khẩu thành công", "success")
+        return redirect(url_for("dashboard.index"))
+
+    return render_template("auth/change_password.html")
 
 
 @auth_bp.route("/logout")
